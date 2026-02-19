@@ -1,0 +1,52 @@
+# Model files
+*.rknn
+*.rkllm
+*.onnx
+*.bin
+*.safetensors
+*.gguf
+*.axmodel
+
+# Numpy weights
+*.npy
+*.npz
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+
+# Compiled
+*.so
+*.o
+*.a
+
+# Build
+build/
+install/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+output*.wav
+generated_codes*.npy
+
+# KV cache
+/tmp/
