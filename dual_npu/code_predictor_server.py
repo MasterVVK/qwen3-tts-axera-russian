@@ -191,7 +191,7 @@ def main():
     parser.add_argument("--socket", default="/tmp/qwen3_cp.sock")
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--top_k", type=int, default=50)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--threads", type=int, default=2)
     args = parser.parse_args()
 
     server = CodePredictorServer(

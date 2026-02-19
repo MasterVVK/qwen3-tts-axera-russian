@@ -29,7 +29,7 @@ EMBEDDINGS_DIR="${EMBEDDINGS_DIR:-${BASE_DIR}/embeddings}"
 
 # Code Predictor
 CP_DIR="${CP_DIR:-${BASE_DIR}/code_predictor}"
-CP_THREADS="${CP_THREADS:-1}"
+CP_THREADS="${CP_THREADS:-2}"
 
 # Vocoder
 VOCODER_MODEL="${VOCODER_MODEL:-${BASE_DIR}/vocoder/vocoder_traced_64_q8.rknn}"
