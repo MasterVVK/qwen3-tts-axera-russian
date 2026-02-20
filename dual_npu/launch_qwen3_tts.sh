@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launch Qwen3-TTS in multi-server mode:
 #   Talker:         llama.cpp CPU A76 (GGUF Q4_K_M, embedding mode)
-#   Code Predictor: ONNX Runtime CPU (single-thread, sequential with talker)
+#   Code Predictor: GGML Q4_0 (~55ms) | ONNX C++ (~240ms) | ONNX Python (~248ms)
 #   Vocoder:        RKNN NPU or ONNX CPU
 #
 # Usage:
@@ -29,10 +29,14 @@ EMBEDDINGS_DIR="${EMBEDDINGS_DIR:-${BASE_DIR}/embeddings}"
 
 # Code Predictor
 CP_DIR="${CP_DIR:-${BASE_DIR}/code_predictor}"
-CP_THREADS="${CP_THREADS:-2}"
+CP_THREADS="${CP_THREADS:-3}"
 
-# Vocoder
-VOCODER_MODEL="${VOCODER_MODEL:-${BASE_DIR}/vocoder/vocoder_traced_64_q8.rknn}"
+# GGML Code Predictor (4.8x faster than ONNX)
+CP_GGML_BINARY="${CP_GGML_BINARY:-/root/qwen3-tts.cpp/build/code_pred_server}"
+CP_GGML_MODEL="${CP_GGML_MODEL:-/root/qwen3-tts.cpp/models/qwen3-tts-0.6b-q4_0.gguf}"
+
+# Vocoder (ONNX preferred — RKNN adds noise)
+VOCODER_MODEL="${VOCODER_MODEL:-${BASE_DIR}/vocoder/vocoder_traced_64.onnx}"
 
 # Sockets
 TALKER_SOCKET="/tmp/qwen3_talker.sock"
@@ -100,7 +104,13 @@ wait_for_socket() {
 # --- Pre-flight checks ---
 echo "=== Qwen3-TTS Multi-Server Pipeline ==="
 echo "Talker:         llama.cpp CPU A76 (GGUF, ~30-35 tok/s)"
-echo "Code Predictor: ONNX Runtime CPU (1-thread, ~374ms/step)"
+if [ "${USE_GGML_CP:-1}" = "1" ] && [ -x "$CP_GGML_BINARY" ] && [ -f "$CP_GGML_MODEL" ]; then
+    echo "Code Predictor: GGML Q4_0 (4 A76 cores, ~55ms/step) ***"
+elif [ "${USE_CPP_CP:-1}" = "1" ] && [ -x "${SCRIPT_DIR}/code_predictor_cpp/build/code_predictor_server" ]; then
+    echo "Code Predictor: C++ ONNX Runtime (3-thread, batch prefill, ~240ms/step)"
+else
+    echo "Code Predictor: Python ONNX Runtime (3-thread, ~248ms/step)"
+fi
 echo "Vocoder:        $(basename $VOCODER_MODEL)"
 echo ""
 
@@ -127,15 +137,36 @@ TALKER_PID=$!
 wait_for_socket "$TALKER_SOCKET" "$TALKER_PID" "Talker" 60 || exit 1
 
 # --- Step 2: Start Code Predictor Server ---
-echo "Starting Code Predictor Server (A76 cores 4-7)..."
-rm -f "$CP_SOCKET"
-
-OPENBLAS_NUM_THREADS=1 taskset -c 4-7 python3 -u "${SCRIPT_DIR}/code_predictor_server.py" \
-    --model_dir "$CP_DIR" \
-    --embeddings_dir "$EMBEDDINGS_DIR" \
-    --socket "$CP_SOCKET" \
-    --threads "$CP_THREADS" &
-CP_PID=$!
+CP_CPP="${SCRIPT_DIR}/code_predictor_cpp/build/code_predictor_server"
+if [ "${USE_GGML_CP:-1}" = "1" ] && [ -x "$CP_GGML_BINARY" ] && [ -f "$CP_GGML_MODEL" ]; then
+    echo "Starting Code Predictor Server [GGML Q4_0] (A76 cores 4-7)..."
+    rm -f "$CP_SOCKET"
+    taskset -c 4-7 "$CP_GGML_BINARY" \
+        --model "$CP_GGML_MODEL" \
+        --socket "$CP_SOCKET" \
+        --temperature 0.1 \
+        --top_k "$TOP_K" &
+    CP_PID=$!
+elif [ "${USE_CPP_CP:-1}" = "1" ] && [ -x "$CP_CPP" ]; then
+    echo "Starting Code Predictor Server [C++ ONNX] (A76 cores 4-7)..."
+    rm -f "$CP_SOCKET"
+    taskset -c 4-7 "$CP_CPP" \
+        --model "${CP_DIR}/code_predictor_decode_step.onnx" \
+        --weights "${CP_DIR}/weights_npy" \
+        --codec_emb "${EMBEDDINGS_DIR}/codec_embedding.npy" \
+        --socket "$CP_SOCKET" \
+        --threads "$CP_THREADS" &
+    CP_PID=$!
+else
+    echo "Starting Code Predictor Server [Python ONNX] (A76 cores 4-7)..."
+    rm -f "$CP_SOCKET"
+    OPENBLAS_NUM_THREADS=1 taskset -c 4-7 python3 -u "${SCRIPT_DIR}/code_predictor_server.py" \
+        --model_dir "$CP_DIR" \
+        --embeddings_dir "$EMBEDDINGS_DIR" \
+        --socket "$CP_SOCKET" \
+        --threads "$CP_THREADS" &
+    CP_PID=$!
+fi
 
 wait_for_socket "$CP_SOCKET" "$CP_PID" "Code Predictor" 30 || exit 1
 
@@ -143,7 +174,8 @@ wait_for_socket "$CP_SOCKET" "$CP_PID" "Code Predictor" 30 || exit 1
 echo "Starting Vocoder Server..."
 rm -f "$VOC_SOCKET"
 
-python3 -u "${SCRIPT_DIR}/vocoder_server.py" \
+# Vocoder on A76 cores (runs after generation, no contention)
+OPENBLAS_NUM_THREADS=1 taskset -c 4-7 python3 -u "${SCRIPT_DIR}/vocoder_server.py" \
     --model "$VOCODER_MODEL" \
     --socket "$VOC_SOCKET" &
 VOC_PID=$!

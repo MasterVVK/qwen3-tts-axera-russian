@@ -32,11 +32,13 @@ HIDDEN_SIZE = 1024
 class CodePredictorServer:
     def __init__(self, model_dir, embeddings_dir,
                  socket_path="/tmp/qwen3_cp.sock",
-                 temperature=0.1, top_k=50, n_threads=1):
+                 temperature=0.1, top_k=50, n_threads=1,
+                 batch_prefill=False):
         self.socket_path = socket_path
         self.temperature = temperature
         self.top_k = top_k
         self.num_groups = 15
+        self.batch_prefill = batch_prefill
 
         # Load weights
         print("Loading code predictor weights...")
@@ -101,13 +103,25 @@ class CodePredictorServer:
             kv[f"past_k_{i}"] = np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32)
             kv[f"past_v_{i}"] = np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32)
 
-        # Position 0: hidden_state
-        h = hidden_state.flatten()[:H].reshape(1, 1, H).astype(np.float32)
-        hidden, kv = self._ort_step(h, 0, kv)
-
-        # Position 1: code_0_embed
-        h = code_0_embed.flatten()[:H].reshape(1, 1, H).astype(np.float32)
-        hidden, kv = self._ort_step(h, 1, kv)
+        if self.batch_prefill:
+            # Batch prefill: positions 0+1 together (~15ms savings per token)
+            h0 = hidden_state.flatten()[:H].astype(np.float32)
+            h1 = code_0_embed.flatten()[:H].astype(np.float32)
+            h_batch = np.stack([h0, h1]).reshape(1, 2, H)
+            feed = {"hidden": h_batch, "position": np.array([0, 1], dtype=np.int64)}
+            feed.update(kv)
+            out = self.sess.run(None, feed)
+            hidden = out[0]
+            kv = {}
+            for i in range(self.num_layers):
+                kv[f"past_k_{i}"] = out[1 + i * 2]
+                kv[f"past_v_{i}"] = out[2 + i * 2]
+        else:
+            # Sequential prefill: numerically exact
+            h = hidden_state.flatten()[:H].reshape(1, 1, H).astype(np.float32)
+            hidden, kv = self._ort_step(h, 0, kv)
+            h = code_0_embed.flatten()[:H].reshape(1, 1, H).astype(np.float32)
+            hidden, kv = self._ort_step(h, 1, kv)
 
         # Sample group 0
         predicted_tokens = []
@@ -191,7 +205,9 @@ def main():
     parser.add_argument("--socket", default="/tmp/qwen3_cp.sock")
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--top_k", type=int, default=50)
-    parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--threads", type=int, default=3)
+    parser.add_argument("--batch_prefill", action="store_true",
+                        help="Batch 2-token prefill (~15ms faster but approximate)")
     args = parser.parse_args()
 
     server = CodePredictorServer(
@@ -201,6 +217,7 @@ def main():
         temperature=args.temperature,
         top_k=args.top_k,
         n_threads=args.threads,
+        batch_prefill=args.batch_prefill,
     )
     server.serve()
 

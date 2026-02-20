@@ -45,12 +45,14 @@ CODEC_BOS_ID = 2149
 CODEC_EOS_ID = 2150
 CODEC_PAD_ID = 2148
 CODEC_NOTHINK_ID = 2155
+CODEC_THINK_BOS_ID = 2156
+CODEC_THINK_EOS_ID = 2157
 
-CODEC_LANG_IDS = {
-    "chinese": 2055, "english": 2050, "german": 2053,
-    "russian": 2069, "french": 2061, "japanese": 2058,
-    "korean": 2065,
-}
+# TTS special tokens (text vocabulary IDs for text_embedding lookup)
+TTS_PAD_TOKEN_ID = 151671
+TTS_BOS_TOKEN_ID = 151672  # <tts_text_bos>
+TTS_EOS_TOKEN_ID = 151673  # <tts_text_eod>
+IM_START_TOKEN_ID = 151644  # <|im_start|>
 
 SENTINEL_DONE = -1
 SENTINEL_ERROR = -2
@@ -81,6 +83,14 @@ class Qwen3TTSTalkerServer:
         print(f"  codec_embedding: {self.codec_embedding.shape}")
         print(f"  codec_head: {self.codec_head.shape}")
 
+        # Pre-compute TTS special embeddings (dual-stream text side)
+        special_ids = np.array([TTS_PAD_TOKEN_ID, TTS_BOS_TOKEN_ID, TTS_EOS_TOKEN_ID])
+        special_embeds = self._embed_text(special_ids)
+        self.tts_pad_embed = special_embeds[0]  # [1024]
+        self.tts_bos_embed = special_embeds[1]  # [1024]
+        self.tts_eos_embed = special_embeds[2]  # [1024]
+        print(f"  TTS special embeds computed (pad/bos/eos)")
+
         # Load tokenizer
         print("Loading tokenizer...")
         from transformers import AutoTokenizer
@@ -108,20 +118,91 @@ class Qwen3TTSTalkerServer:
         return (h @ self.proj_fc2_w.T + self.proj_fc2_b).astype(np.float32)
 
     def _build_prefix(self, text_token_ids, language="russian"):
-        text_embeds = self._embed_text(text_token_ids)
-        lang_id = CODEC_LANG_IDS.get(language, CODEC_LANG_IDS["russian"])
-        special_ids = [CODEC_PAD_ID, lang_id, CODEC_NOTHINK_ID, CODEC_BOS_ID]
-        codec_embeds = self.codec_embedding[special_ids]
-        return np.concatenate([text_embeds, codec_embeds], axis=0).astype(np.float32)
+        """Build dual-stream prefix matching official Qwen3-TTS.
 
-    def _sample_token(self, hidden_state):
-        logits = hidden_state @ self.codec_head.T
-        logits = logits[:2048]
+        Structure (text_stream + codec_stream summed at each position):
+          [role_0, role_1, role_2]                     -- embed_text only
+          [pad+nothink, pad+think_bos, pad+think_eos]  -- tts_pad + codec
+          [bos+pad]                                     -- tts_bos + codec_pad
+          [text(t0)+pad, ..., text(tN)+pad, eos+pad]    -- text + codec_pad
+          [pad+bos]                                     -- tts_pad + codec_bos
+        """
+        # Role tokens: <|im_start|> assistant \n (pure text stream)
+        role_ids = np.array([IM_START_TOKEN_ID, 77091, 198])
+        role_embeds = self._embed_text(role_ids)  # [3, 1024]
+
+        # Codec prefix: tts_pad + codec_special [nothink, think_bos, think_eos]
+        codec_prefix = self.codec_embedding[
+            [CODEC_NOTHINK_ID, CODEC_THINK_BOS_ID, CODEC_THINK_EOS_ID]
+        ]  # [3, 1024]
+        text_for_codec = np.stack([self.tts_pad_embed] * 3)  # [3, 1024]
+        dual_codec = text_for_codec + codec_prefix  # [3, 1024]
+
+        # Transition: tts_bos + codec_pad
+        transition = (self.tts_bos_embed + self.codec_embedding[CODEC_PAD_ID])[np.newaxis]  # [1, 1024]
+
+        # Text tokens + tts_eos: text_proj(token) + codec_pad
+        text_embeds = self._embed_text(text_token_ids)  # [N, 1024]
+        text_plus_eos = np.concatenate(
+            [text_embeds, self.tts_eos_embed[np.newaxis]], axis=0
+        )  # [N+1, 1024]
+        codec_pad_tile = np.tile(
+            self.codec_embedding[CODEC_PAD_ID], (len(text_token_ids) + 1, 1)
+        )  # [N+1, 1024]
+        dual_text = text_plus_eos + codec_pad_tile  # [N+1, 1024]
+
+        # Final: tts_pad + codec_bos
+        final = (self.tts_pad_embed + self.codec_embedding[CODEC_BOS_ID])[np.newaxis]  # [1, 1024]
+
+        prefix = np.concatenate(
+            [role_embeds, dual_codec, transition, dual_text, final], axis=0
+        ).astype(np.float32)
+        return prefix
+
+    def _sample_token(self, hidden_state, past_tokens=None, n_text_tokens=0):
+        """Sample codec token. Allows audio (0-2047) + EOS (2150), masks rest."""
+        logits = hidden_state @ self.codec_head.T  # [3072]
+
+        # Mask special tokens except EOS: suppress 2048-2149 and 2151+
+        logits[2048:CODEC_EOS_ID] = -1e10
+        if CODEC_EOS_ID + 1 < len(logits):
+            logits[CODEC_EOS_ID + 1:] = -1e10
+
+        # Adaptive EOS boost (compensates GGUF underweighting EOS logit)
+        if past_tokens is not None and n_text_tokens > 0:
+            expected_len = n_text_tokens * 3
+            progress = len(past_tokens) / expected_len if expected_len > 0 else 0
+            if progress > 0.8:
+                boost = min((progress - 0.8) / 0.7, 1.0) * 15.0
+                logits[CODEC_EOS_ID] += boost
+            if progress > 2.0:
+                return CODEC_EOS_ID  # force EOS
+
+        # Repetition penalty (window=30, deduplicated)
+        if past_tokens:
+            for t in set(past_tokens[-30:]):
+                if 0 <= t < len(logits):
+                    if logits[t] > 0:
+                        logits[t] /= 1.2
+                    else:
+                        logits[t] *= 1.2
+
+        # Top-K sampling
         top_indices = np.argsort(logits)[-self.top_k:]
         top_logits = logits[top_indices]
-        probs = np.exp((top_logits - top_logits.max()) / max(self.temperature, 1e-6))
+        scaled = top_logits / max(self.temperature, 1e-6)
+        probs = np.exp(scaled - scaled.max())
         probs /= probs.sum()
-        return int(top_indices[np.random.choice(len(top_indices), p=probs)])
+
+        # Top-p (nucleus) filtering
+        sorted_idx = np.argsort(-probs)
+        cumsum = np.cumsum(probs[sorted_idx])
+        cutoff = np.searchsorted(cumsum, 0.95) + 1
+        keep = sorted_idx[:cutoff]
+        probs_filtered = probs[keep]
+        probs_filtered /= probs_filtered.sum()
+        chosen = keep[np.random.choice(len(keep), p=probs_filtered)]
+        return int(top_indices[chosen])
 
     def _prefix_hash(self, prefix):
         return hashlib.md5(prefix.tobytes()).hexdigest()[:16]
@@ -166,9 +247,12 @@ class Qwen3TTSTalkerServer:
         # Generate tokens
         t_gen_start = time.time()
         out_tokens = 0
+        past_tokens = []
+        n_text_tokens = len(text_token_ids)
 
         for i in range(self.max_tokens):
-            code_0 = self._sample_token(hidden)
+            code_0 = self._sample_token(hidden, past_tokens=past_tokens,
+                                         n_text_tokens=n_text_tokens)
 
             if code_0 == CODEC_EOS_ID or code_0 >= 2048:
                 print(f"  EOS at step {i} (token={code_0})")
@@ -183,6 +267,7 @@ class Qwen3TTSTalkerServer:
                 return out_tokens
 
             out_tokens += 1
+            past_tokens.append(code_0)
 
             # Wait for feedback embedding from client
             try:
