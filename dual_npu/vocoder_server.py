@@ -37,10 +37,14 @@ class VocoderServer:
 
         if self.is_onnx:
             import onnxruntime as ort
-            self.sess = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = 4
+            opts.inter_op_num_threads = 1
+            self.sess = ort.InferenceSession(model_path, sess_options=opts,
+                                              providers=['CPUExecutionProvider'])
             inp_shape = self.sess.get_inputs()[0].shape
             self.max_tokens = inp_shape[1]
-            print(f"Vocoder: ONNX CPU, max_tokens={self.max_tokens}")
+            print(f"Vocoder: ONNX CPU (4 threads), max_tokens={self.max_tokens}")
         else:
             from rknnlite.api import RKNNLite
             self.rknn = RKNNLite()
@@ -60,9 +64,28 @@ class VocoderServer:
     def _signal_handler(self, signum, frame):
         self._running = False
 
+    def _inference_chunk(self, padded):
+        if self.is_onnx:
+            return self.sess.run(None, {'audio_codes': padded})[0].flatten()
+        else:
+            return self.rknn.inference(inputs=[padded])[0].flatten()
+
     def synthesize(self, codes_array):
         n_tokens = len(codes_array)
-        audio_chunks = []
+
+        # Single chunk — no overlap needed
+        if n_tokens <= self.max_tokens:
+            padded = np.zeros((1, self.max_tokens, 16), dtype=np.int64)
+            padded[0, :n_tokens, :] = codes_array[:, :16]
+            audio = self._inference_chunk(padded)
+            return audio[:n_tokens * SAMPLES_PER_TOKEN]
+
+        # Multi-chunk with overlap-crossfade to avoid boundary artifacts
+        OVERLAP = 16  # tokens of overlap between chunks
+        OVERLAP_SAMPLES = OVERLAP * SAMPLES_PER_TOKEN
+        step = self.max_tokens - OVERLAP  # 56 tokens advance per chunk
+
+        result = np.array([], dtype=np.float32)
         chunk_start = 0
 
         while chunk_start < n_tokens:
@@ -71,19 +94,31 @@ class VocoderServer:
             padded = np.zeros((1, self.max_tokens, 16), dtype=np.int64)
             padded[0, :chunk_len, :] = codes_array[chunk_start:chunk_end, :16]
 
-            if self.is_onnx:
-                outputs = self.sess.run(None, {'audio_codes': padded})
+            audio_chunk = self._inference_chunk(padded)
+            actual_samples = chunk_len * SAMPLES_PER_TOKEN
+            audio_chunk = audio_chunk[:actual_samples]
+
+            if chunk_start == 0:
+                # First chunk: keep all audio
+                result = audio_chunk
             else:
-                outputs = self.rknn.inference(inputs=[padded])
+                # Crossfade overlap region
+                if len(result) >= OVERLAP_SAMPLES and len(audio_chunk) >= OVERLAP_SAMPLES:
+                    fade_out = np.linspace(1.0, 0.0, OVERLAP_SAMPLES, dtype=np.float32)
+                    fade_in = 1.0 - fade_out
+                    blended = (result[-OVERLAP_SAMPLES:] * fade_out +
+                               audio_chunk[:OVERLAP_SAMPLES] * fade_in)
+                    result = np.concatenate([
+                        result[:-OVERLAP_SAMPLES],
+                        blended,
+                        audio_chunk[OVERLAP_SAMPLES:]
+                    ])
+                else:
+                    result = np.concatenate([result, audio_chunk])
 
-            audio_chunk = outputs[0].flatten()
-            actual_samples = int(chunk_len * SAMPLES_PER_TOKEN)
-            audio_chunks.append(audio_chunk[:actual_samples])
-            chunk_start = chunk_end
+            chunk_start += step
 
-        if not audio_chunks:
-            return np.array([], dtype=np.float32)
-        return np.concatenate(audio_chunks)
+        return result
 
     def serve(self):
         if os.path.exists(self.socket_path):

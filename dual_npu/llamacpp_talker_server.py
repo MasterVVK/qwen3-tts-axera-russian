@@ -95,7 +95,8 @@ class Qwen3TTSTalkerServer:
         print("Loading tokenizer...")
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            "Qwen/Qwen3-TTS-12Hz-0.6B-Base", trust_remote_code=True
+            "Qwen/Qwen3-TTS-12Hz-0.6B-Base", trust_remote_code=True,
+            local_files_only=True
         )
 
         # Load llama.cpp model

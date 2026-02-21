@@ -15,6 +15,8 @@
 
 set -e
 
+export HF_HUB_OFFLINE=1
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --- Configuration ---
@@ -35,7 +37,7 @@ CP_THREADS="${CP_THREADS:-3}"
 CP_GGML_BINARY="${CP_GGML_BINARY:-/root/qwen3-tts.cpp/build/code_pred_server}"
 CP_GGML_MODEL="${CP_GGML_MODEL:-/root/qwen3-tts.cpp/models/qwen3-tts-0.6b-q4_0.gguf}"
 
-# Vocoder (ONNX preferred — RKNN adds noise)
+# Vocoder (ONNX FP32 — RKNN Q8 has unusable quality due to Snake activation)
 VOCODER_MODEL="${VOCODER_MODEL:-${BASE_DIR}/vocoder/vocoder_traced_64.onnx}"
 
 # Sockets
@@ -111,7 +113,12 @@ elif [ "${USE_CPP_CP:-1}" = "1" ] && [ -x "${SCRIPT_DIR}/code_predictor_cpp/buil
 else
     echo "Code Predictor: Python ONNX Runtime (3-thread, ~248ms/step)"
 fi
-echo "Vocoder:        $(basename $VOCODER_MODEL)"
+VOC_NAME="$(basename $VOCODER_MODEL)"
+if [[ "$VOC_NAME" == *.rknn ]]; then
+    echo "Vocoder:        $VOC_NAME (RKNN NPU, ~2.85s/64-tok chunk)"
+else
+    echo "Vocoder:        $VOC_NAME (ONNX CPU, ~5.0s/64-tok chunk)"
+fi
 echo ""
 
 if [ ! -f "$GGUF_MODEL" ]; then

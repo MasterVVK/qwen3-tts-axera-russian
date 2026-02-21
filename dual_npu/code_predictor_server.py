@@ -183,9 +183,8 @@ class CodePredictorServer:
                 codes = self.predict(hidden_state, code_0)
                 dt = time.time() - t0
 
-                # Send back 15 codes
-                for c in codes:
-                    conn.sendall(struct.pack("<i", c))
+                # Send back 15 codes as single block
+                conn.sendall(np.array(codes[:15], dtype=np.int32).tobytes())
 
             except Exception as e:
                 print(f"  CP Error: {e}")
