@@ -62,7 +62,7 @@ class Qwen3TTSTalkerServer:
     def __init__(self, model_path, embeddings_dir,
                  socket_path="/tmp/qwen3_talker.sock",
                  temperature=0.8, top_k=50,
-                 max_tokens=200, n_threads=4,
+                 max_tokens=1000, n_threads=4,
                  kv_cache_dir="/tmp"):
         self.socket_path = socket_path
         self.temperature = temperature
@@ -101,7 +101,19 @@ class Qwen3TTSTalkerServer:
 
         # Load llama.cpp model
         print(f"Loading llama.cpp model: {model_path}")
-        self.llm = LlamaCppModel(model_path, n_ctx=512, n_threads=n_threads)
+        # n_ctx is the utterance-length ceiling: the prefix KV and the generated
+        # tokens share it, so the old 512 capped a long text at ~40 s of audio
+        # before the adaptive EOS (natural ~3x the text length, forced at 6x)
+        # could fire. KV is 112 KB/token here (28 layers x 8 kv heads x 128 x 2 B
+        # x 2), so 2048 reserves 224 MiB of KV; the model's trained context is 32768.
+        # n_batch stays decoupled from it (the wrapper feeds n_batch into
+        # params.n_batch/n_ubatch, which sizes the ggml compute buffer: 2048 ->
+        # 1243 MiB, 512 -> 311 MiB of graph scratch resident on the 4 A76 cores
+        # the code predictor shares).
+        self.llm = LlamaCppModel(model_path,
+                                 n_ctx=int(os.environ.get("N_CTX", "2048")),
+                                 n_batch=int(os.environ.get("N_BATCH", "512")),
+                                 n_threads=n_threads)
         print(f"  Model loaded. n_embd={self.llm.n_embd}")
 
         self._running = True
@@ -251,7 +263,15 @@ class Qwen3TTSTalkerServer:
         past_tokens = []
         n_text_tokens = len(text_token_ids)
 
-        for i in range(self.max_tokens):
+        # The context is the hard ceiling: prefix + generated must fit in n_ctx,
+        # so a fixed --max_tokens both truncates long texts and (for short ones
+        # with a big cap) would run past the context. Clamp per request.
+        budget = min(self.max_tokens, self.llm.n_ctx - prefix.shape[0] - 1)
+        if budget < self.max_tokens:
+            print(f"  MAX_TOKENS {self.max_tokens} clamped to {budget} "
+                  f"(prefix {prefix.shape[0]} + n_ctx {self.llm.n_ctx})")
+
+        for i in range(budget):
             code_0 = self._sample_token(hidden, past_tokens=past_tokens,
                                          n_text_tokens=n_text_tokens)
 
@@ -381,7 +401,7 @@ def main():
     parser.add_argument("--socket", default="/tmp/qwen3_talker.sock")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=50)
-    parser.add_argument("--max_tokens", type=int, default=200)
+    parser.add_argument("--max_tokens", type=int, default=1000)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--kv_cache_dir", default="/tmp")
     args = parser.parse_args()

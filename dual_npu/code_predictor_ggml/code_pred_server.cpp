@@ -90,6 +90,9 @@ static void print_usage(const char* prog) {
            "  --socket PATH      Unix socket path (default: /tmp/qwen3_cp.sock)\n"
            "  --temperature F    Sampling temperature (default: 0.1)\n"
            "  --top_k N          Top-K sampling (default: 50)\n"
+           "  --threads N        Intra-op threads for the ggml CPU backend "
+           "(default: ggml's own default, = nproc; set it to the core count you "
+           "pinned with taskset, oversubscription costs real time)\n"
            "  --help             Show this help\n",
            prog);
 }
@@ -102,23 +105,26 @@ int main(int argc, char** argv) {
     std::string socket_path = "/tmp/qwen3_cp.sock";
     float temperature = 0.1f;
     int top_k = 50;
+    int n_threads = 0;
 
     static struct option long_opts[] = {
         {"model",       required_argument, nullptr, 'm'},
         {"socket",      required_argument, nullptr, 's'},
         {"temperature", required_argument, nullptr, 'T'},
         {"top_k",       required_argument, nullptr, 'k'},
+        {"threads",     required_argument, nullptr, 't'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:s:T:k:h", long_opts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:s:T:k:t:h", long_opts, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 's': socket_path = optarg; break;
             case 'T': temperature = atof(optarg); break;
             case 'k': top_k = atoi(optarg); break;
+            case 't': n_threads = atoi(optarg); break;
             case 'h': print_usage(argv[0]); return 0;
             default:  print_usage(argv[0]); return 1;
         }
@@ -139,6 +145,7 @@ int main(int argc, char** argv) {
     printf("Model:    %s\n", model_path.c_str());
     printf("Temp:     %.2f\n", temperature);
     printf("Top-K:    %d\n", top_k);
+    printf("Threads:  %s\n", n_threads > 0 ? std::to_string(n_threads).c_str() : "ggml default");
 
     qwen3_tts::TTSTransformer transformer;
 
@@ -156,12 +163,22 @@ int main(int argc, char** argv) {
 
     auto config = transformer.get_config();
     printf("Model loaded in %.0f ms\n", load_ms);
+    if (n_threads > 0) {
+        transformer.set_n_threads(n_threads);
+    }
     printf("  hidden_size=%d, cp_layers=%d, codebooks=%d, cp_vocab=%d\n",
            config.hidden_size, config.code_pred_layers,
            config.n_codebooks, config.code_pred_vocab_size);
 
     int hidden_size = config.hidden_size;
     int num_output_codes = config.n_codebooks - 1; // codebooks 1..15
+
+#ifdef QWEN3_TTS_TIMING
+    // Per-phase breakdown of the 15-step request (build/alloc/compute/data),
+    // accumulated by the library and averaged here per request.
+    qwen3_tts::tts_timing timing;
+    transformer.set_timing(&timing);
+#endif
 
     // --- Warmup ---
     printf("\nWarmup...\n");
@@ -175,6 +192,17 @@ int main(int argc, char** argv) {
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         printf("  warmup %d: %.1fms, %zu codes\n", w + 1, ms, output_codes.size());
     }
+
+#ifdef QWEN3_TTS_TIMING
+    // t_code_pred_ms is only accumulated by generate(); the standalone server
+    // calls predict_codes_autoregressive() directly, so sum the sub-phases.
+    printf("  phases per request (ms): init %.1f + prefill %.1f + steps %.1f\n",
+           timing.t_code_pred_init_ms / 3,
+           timing.t_code_pred_prefill_ms / 3, timing.t_code_pred_steps_ms / 3);
+    printf("  phases by kind  (ms): build %.1f + alloc %.1f + compute %.1f + data %.1f\n",
+           timing.t_code_pred_graph_build_ms / 3, timing.t_code_pred_graph_alloc_ms / 3,
+           timing.t_code_pred_compute_ms / 3, timing.t_code_pred_data_ms / 3);
+#endif
 
     // --- Create server socket ---
     int server_fd = create_server_socket(socket_path.c_str());

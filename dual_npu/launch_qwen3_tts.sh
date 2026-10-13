@@ -22,6 +22,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # --- Configuration ---
 BASE_DIR="${BASE_DIR:-/root/tts-rknn}"
 
+# Interpreter for the Python servers. The board usually has ONNX Runtime + transformers
+# in a venv, and this script calls the interpreter bare by default.
+PYTHON="${PYTHON:-python3}"
+
+# Core pinning (RK3588: 0-3 = A55, 4-7 = A76). Defaults keep every server on the big
+# cores: measured on RK3588, moving the FP32 ONNX vocoder to the A55 cluster costs
+# 4.2x wall time (8.8 s -> 36.9 s per 80 tokens) — more than streaming can win back.
+# Worth splitting only if VOCODER_MODEL is the RKNN build (NPU) or the board has more
+# big cores than the servers need.
+TALKER_CORES="${TALKER_CORES:-4-7}"
+CP_CORES="${CP_CORES:-4-7}"
+VOC_CORES="${VOC_CORES:-4-7}"
+
 # Talker (llama.cpp)
 GGUF_MODEL="${GGUF_MODEL:-${BASE_DIR}/qwen3_tts_talker_q4_k_m.gguf}"
 GGUF_THREADS="${GGUF_THREADS:-4}"
@@ -33,12 +46,23 @@ EMBEDDINGS_DIR="${EMBEDDINGS_DIR:-${BASE_DIR}/embeddings}"
 CP_DIR="${CP_DIR:-${BASE_DIR}/code_predictor}"
 CP_THREADS="${CP_THREADS:-3}"
 
-# GGML Code Predictor (4.8x faster than ONNX)
+# GGML Code Predictor (4.8x faster than ONNX). CP_GGML_THREADS caps the ggml intra-op
+# threads: ggml's default is nproc, which oversubscribes a taskset-pinned core set.
 CP_GGML_BINARY="${CP_GGML_BINARY:-/root/qwen3-tts.cpp/build/code_pred_server}"
-CP_GGML_MODEL="${CP_GGML_MODEL:-/root/qwen3-tts.cpp/models/qwen3-tts-0.6b-q4_0.gguf}"
+# NOTE the 'cp-' in the name: that is what scripts/quantize_code_predictor_gguf.py
+# produces. The old default (qwen3-tts-0.6b-q4_0.gguf) matches no file on the board,
+# and because the backend probe is `[ -f $CP_GGML_MODEL ]`, a stale path silently
+# drops the pipeline onto the Python ONNX CP — measured 64 -> 390 ms per 15-step
+# request, i.e. 6x, with nothing in the log but the header line.
+CP_GGML_MODEL="${CP_GGML_MODEL:-/root/qwen3-tts.cpp/models/qwen3-tts-0.6b-cp-q8_0.gguf}"
+CP_GGML_THREADS="${CP_GGML_THREADS:-4}"
 
-# Vocoder (ONNX FP32 — RKNN Q8 has unusable quality due to Snake activation)
+# Vocoder (RKNN FP16 on the NPU — Snake activation makes every *quantized* build
+# unusable, FP16 is not quantized and measures lossless)
 VOCODER_MODEL="${VOCODER_MODEL:-${BASE_DIR}/vocoder/vocoder_traced_64.onnx}"
+# Stateful models only: a small-B export voices the FIRST group of each utterance,
+# which is the audio the listener waits for (TTFB). Empty = single-model behaviour.
+VOCODER_MODEL_FIRST="${VOCODER_MODEL_FIRST:-}"
 
 # Sockets
 TALKER_SOCKET="/tmp/qwen3_talker.sock"
@@ -48,7 +72,7 @@ VOC_SOCKET="/tmp/qwen3_voc.sock"
 # Generation params
 TEMPERATURE="${TEMPERATURE:-0.8}"
 TOP_K="${TOP_K:-50}"
-MAX_TOKENS="${MAX_TOKENS:-200}"
+MAX_TOKENS="${MAX_TOKENS:-1000}"
 LANGUAGE="${LANGUAGE:-russian}"
 
 # --- Parse arguments ---
@@ -74,6 +98,19 @@ cleanup() {
         pid="${!pid_var}"
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null
+            # SIGTERM alone does not always work: the GGML code predictor blocks in
+            # accept() and its SIGTERM handler only flips a flag the serve loop
+            # re-reads after a connection, so an idle server can ignore the signal
+            # and outlive the daemon (measured: stale instances piling up to GBs).
+            # Give a short grace, then escalate to SIGKILL so teardown always reaps.
+            for _ in $(seq 1 6); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.5
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null
+                echo "  Killed PID $pid ($pid_var) (SIGKILL after 3s grace)"
+            fi
             wait "$pid" 2>/dev/null || true
             echo "  Stopped PID $pid ($pid_var)"
         fi
@@ -131,7 +168,7 @@ fi
 echo "Starting Talker Server (A76 cores 4-7)..."
 rm -f "$TALKER_SOCKET"
 
-OPENBLAS_NUM_THREADS=1 taskset -c 4-7 python3 -u "${SCRIPT_DIR}/llamacpp_talker_server.py" \
+OPENBLAS_NUM_THREADS=1 taskset -c "$TALKER_CORES" "$PYTHON" -u "${SCRIPT_DIR}/llamacpp_talker_server.py" \
     --model "$GGUF_MODEL" \
     --embeddings "$EMBEDDINGS_DIR" \
     --socket "$TALKER_SOCKET" \
@@ -148,16 +185,17 @@ CP_CPP="${SCRIPT_DIR}/code_predictor_cpp/build/code_predictor_server"
 if [ "${USE_GGML_CP:-1}" = "1" ] && [ -x "$CP_GGML_BINARY" ] && [ -f "$CP_GGML_MODEL" ]; then
     echo "Starting Code Predictor Server [GGML Q4_0] (A76 cores 4-7)..."
     rm -f "$CP_SOCKET"
-    taskset -c 4-7 "$CP_GGML_BINARY" \
+    taskset -c "$CP_CORES" "$CP_GGML_BINARY" \
         --model "$CP_GGML_MODEL" \
         --socket "$CP_SOCKET" \
         --temperature 0.1 \
-        --top_k "$TOP_K" &
+        --top_k "$TOP_K" \
+        --threads "$CP_GGML_THREADS" &
     CP_PID=$!
 elif [ "${USE_CPP_CP:-1}" = "1" ] && [ -x "$CP_CPP" ]; then
     echo "Starting Code Predictor Server [C++ ONNX] (A76 cores 4-7)..."
     rm -f "$CP_SOCKET"
-    taskset -c 4-7 "$CP_CPP" \
+    taskset -c "$CP_CORES" "$CP_CPP" \
         --model "${CP_DIR}/code_predictor_decode_step.onnx" \
         --weights "${CP_DIR}/weights_npy" \
         --codec_emb "${EMBEDDINGS_DIR}/codec_embedding.npy" \
@@ -167,7 +205,7 @@ elif [ "${USE_CPP_CP:-1}" = "1" ] && [ -x "$CP_CPP" ]; then
 else
     echo "Starting Code Predictor Server [Python ONNX] (A76 cores 4-7)..."
     rm -f "$CP_SOCKET"
-    OPENBLAS_NUM_THREADS=1 taskset -c 4-7 python3 -u "${SCRIPT_DIR}/code_predictor_server.py" \
+    OPENBLAS_NUM_THREADS=1 taskset -c "$CP_CORES" "$PYTHON" -u "${SCRIPT_DIR}/code_predictor_server.py" \
         --model_dir "$CP_DIR" \
         --embeddings_dir "$EMBEDDINGS_DIR" \
         --socket "$CP_SOCKET" \
@@ -181,9 +219,10 @@ wait_for_socket "$CP_SOCKET" "$CP_PID" "Code Predictor" 30 || exit 1
 echo "Starting Vocoder Server..."
 rm -f "$VOC_SOCKET"
 
-# Vocoder on A76 cores (runs after generation, no contention)
-OPENBLAS_NUM_THREADS=1 taskset -c 4-7 python3 -u "${SCRIPT_DIR}/vocoder_server.py" \
+# Vocoder on its own cores: in streaming mode it runs concurrently with generation
+OPENBLAS_NUM_THREADS=1 taskset -c "$VOC_CORES" "$PYTHON" -u "${SCRIPT_DIR}/vocoder_server.py" \
     --model "$VOCODER_MODEL" \
+    ${VOCODER_MODEL_FIRST:+--model_first "$VOCODER_MODEL_FIRST"} \
     --socket "$VOC_SOCKET" &
 VOC_PID=$!
 
@@ -202,7 +241,7 @@ else
     echo "Running TTS: \"$TEXT\""
     echo ""
 
-    python3 "${SCRIPT_DIR}/tts_client.py" \
+    "$PYTHON" "${SCRIPT_DIR}/tts_client.py" \
         "$TEXT" \
         --language "$LANGUAGE" \
         --output output.wav \

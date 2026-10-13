@@ -88,7 +88,7 @@ class LlamaCppModel:
     and extracts hidden states (not logits).
     """
 
-    def __init__(self, model_path, n_ctx=512, n_threads=4):
+    def __init__(self, model_path, n_ctx=512, n_batch=512, n_threads=4):
         _lib.wrapper_backend_init()
 
         self.model = _lib.wrapper_load_model(model_path.encode(), 0)
@@ -99,15 +99,17 @@ class LlamaCppModel:
         assert self.n_embd > 0, f"n_embd={self.n_embd}"
 
         self.ctx = _lib.wrapper_create_context(
-            self.model, n_ctx, n_ctx, n_threads, 1  # embeddings=1
+            self.model, n_ctx, n_batch, n_threads, 1  # embeddings=1
         )
         if not self.ctx:
             raise RuntimeError("Failed to create llama context")
 
         self._pos = 0
+        self.n_ctx = n_ctx
         self._hidden_buf = np.zeros(self.n_embd, dtype=np.float32)
 
-        print(f"LlamaCppModel ready: n_embd={self.n_embd}, n_ctx={n_ctx}, threads={n_threads}")
+        print(f"LlamaCppModel ready: n_embd={self.n_embd}, n_ctx={n_ctx}, "
+              f"n_batch={n_batch}, threads={n_threads}")
 
     def get_hidden(self, embeddings, keep_history=0):
         """Run forward pass with custom embeddings, return last hidden state.

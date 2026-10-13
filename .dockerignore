@@ -1,0 +1,12 @@
+.git
+qwen3_tts_embeddings/
+qwen3_tts_talker_as_qwen3/
+code_predictor_onnx/
+*.gguf
+*.onnx
+*.onnx.data
+*.axmodel
+*.npy
+*.npz
+*.wav
+*:memory:.ses

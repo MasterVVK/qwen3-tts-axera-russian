@@ -2,6 +2,8 @@
 *.rknn
 *.rkllm
 *.onnx
+# external-data sidecars of the *.onnx above
+*.onnx.data
 *.bin
 *.safetensors
 *.gguf
@@ -48,5 +50,14 @@ Thumbs.db
 output*.wav
 generated_codes*.npy
 
+# Converter output dirs (scripts/ defaults, multi-GB)
+models/
+qwen3_tts_embeddings/
+qwen3_tts_talker_as_qwen3/
+code_predictor_onnx/
+
 # KV cache
 /tmp/
+
+# NPU runtime libs (not in git)
+third_party/

@@ -122,7 +122,8 @@ def main():
             "position_ids": {0: "batch", 1: "seq_len"},
             "output": {0: "batch", 1: "seq_len"},
         },
-        opset_version=17,
+        # opset 17 dies on torch>=2.9/onnx>=1.17: 'No Adapter To Version $17 for Pad'
+        opset_version=18,
         do_constant_folding=True,
     )
     print(f"ONNX saved: {onnx_path} ({os.path.getsize(onnx_path)/1024/1024:.1f} MB)")

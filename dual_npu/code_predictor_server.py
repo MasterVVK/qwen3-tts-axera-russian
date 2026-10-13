@@ -50,10 +50,25 @@ class CodePredictorServer:
         # Load codec embedding for code_0 lookup
         self.codec_embedding = np.load(os.path.join(embeddings_dir, "codec_embedding.npy"))
 
-        # Load ONNX model
+        # Load ONNX model. Two graphs are supported and they are not
+        # interchangeable: the KV-cache decode-step export (one token per call,
+        # past_k_i/past_v_i in and out) and the plain transformer-core export
+        # that scripts/export_code_predictor_onnx.py actually produces
+        # (hidden_states/position_ids, no KV cache).
         print("Loading ONNX code predictor...")
         import onnxruntime as ort
+        self.mode = "decode_step"
         onnx_path = os.path.join(model_dir, "code_predictor_decode_step.onnx")
+        if not os.path.exists(onnx_path):
+            onnx_path = os.path.join(model_dir, "code_predictor_core.onnx")
+            if not os.path.exists(onnx_path):
+                sys.exit(
+                    f"ERROR: no code predictor ONNX in {model_dir} — expected "
+                    f"code_predictor_decode_step.onnx (KV cache) or "
+                    f"code_predictor_core.onnx (transformer core). Run "
+                    f"scripts/export_code_predictor_onnx.py."
+                )
+            self.mode = "core"
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = n_threads
         opts.inter_op_num_threads = n_threads
@@ -65,7 +80,8 @@ class CodePredictorServer:
         self.head_dim = w["layer_0_q_proj"].shape[0] // 16
         self.num_kv_heads = 8
 
-        print(f"  ONNX loaded: {self.num_layers} layers, head_dim={self.head_dim}")
+        print(f"  ONNX loaded: {self.mode} mode, {self.num_layers} layers, "
+              f"head_dim={self.head_dim}")
 
         self._running = True
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -85,17 +101,44 @@ class CodePredictorServer:
         return out[0], new_kv
 
     def _sample(self, logits):
+        if self.temperature <= 0.0:
+            return int(np.argmax(logits))
         top_indices = np.argpartition(logits, -self.top_k)[-self.top_k:]
         top_logits = logits[top_indices]
         probs = np.exp((top_logits - top_logits.max()) / max(self.temperature, 1e-6))
         probs /= probs.sum()
         return int(top_indices[np.random.choice(len(top_indices), p=probs)])
 
+    def _ort_core(self, seq):
+        """Transformer-core export: no KV cache, the whole prefix goes in every call."""
+        n = len(seq)
+        out = self.sess.run(None, {
+            "hidden_states": np.stack(seq).reshape(1, n, HIDDEN_SIZE),
+            "position_ids": np.arange(n, dtype=np.int64).reshape(1, n),
+        })
+        return out[0]
+
     def predict(self, hidden_state, code_0):
         """Predict groups 1-15 from hidden_state and code_0."""
         H = HIDDEN_SIZE
         # Use TALKER's codec embedding for code_0 (matches official model)
         code_0_embed = self.codec_embedding[code_0]
+
+        if self.mode == "core":
+            # No KV cache in this graph: re-run the growing prefix each step
+            # (O(n^2) in 16 positions — a fallback backend, speed is not its job).
+            seq = [hidden_state.flatten()[:H].astype(np.float32),
+                   code_0_embed.flatten()[:H].astype(np.float32)]
+            predicted_tokens = []
+            hidden = self._ort_core(seq)
+            token = self._sample(hidden[0, -1] @ self.lm_heads[0].T)
+            predicted_tokens.append(token)
+            for step in range(1, self.num_groups):
+                seq.append(self.codec_embeddings[step - 1][token].astype(np.float32))
+                hidden = self._ort_core(seq)
+                token = self._sample(hidden[0, -1] @ self.lm_heads[step].T)
+                predicted_tokens.append(token)
+            return predicted_tokens
 
         # Init empty KV caches
         kv = {}
